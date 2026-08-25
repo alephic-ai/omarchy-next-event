@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.noahbrier.next-event",
+  "name": "Next Event",
+  "version": "0.1.0",
+  "author": "Noah Brier",
+  "license": "MIT",
+  "description": "Show the next calendar meeting and open its meeting link from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Next Event",
+    "description": "ICS-first next meeting indicator with click-to-join.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "refreshIntervalSec": 60,
+      "pythonPath": ""
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 60
+      },
+      {
+        "key": "pythonPath",
+        "type": "string",
+        "label": "Python executable",
+        "defaultValue": ""
+      }
+    ]
+  }
+}
+

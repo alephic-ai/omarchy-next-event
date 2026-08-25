@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import sys
+import re
+import subprocess
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+import requests
+from icalendar import Calendar
+import recurring_ical_events
+
+def fetch_ics(url, cache_file):
+    """Fetch ICS data with caching using ETag/Last-Modified headers."""
+    headers = {}
+
+    # Load cached headers if they exist
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                cached_data = json.load(f)
+
+            # Check if cache is recent (within 5 minutes)
+            cached_time = datetime.fromisoformat(cached_data.get('timestamp', ''))
+            if datetime.now(timezone.utc) - cached_time < timedelta(minutes=5):
+                return cached_data.get('content', '')
+
+            # Add conditional headers
+            if 'etag' in cached_data:
+                headers['If-None-Match'] = cached_data['etag']
+            if 'last_modified' in cached_data:
+                headers['If-Modified-Since'] = cached_data['last_modified']
+        except:
+            pass
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+
+        # If not modified, return cached content
+        if response.status_code == 304 and cache_file.exists():
+            with open(cache_file, 'r') as f:
+                return json.load(f).get('content', '')
+
+        if response.status_code == 200:
+            # Save new content and headers
+            cache_data = {
+                'content': response.text,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'etag': response.headers.get('ETag'),
+                'last_modified': response.headers.get('Last-Modified')
+            }
+
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, 'w') as f:
+                json.dump(cache_data, f)
+
+            return response.text
+
+    except requests.RequestException:
+        # Fall back to cached content if network fails
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r') as f:
+                    return json.load(f).get('content', '')
+            except:
+                pass
+
+    return ''
+
+def extract_link(event):
+    """Extract meeting link from various event properties."""
+    # Common patterns for meeting links
+    link_patterns = [
+        r'https://[a-zA-Z0-9.-]*\.zoom\.us/j/[0-9]+(?:\?[^\s]*)?',
+        r'https://meet\.google\.com/[a-z0-9-]+',
+        r'https://teams\.microsoft\.com/l/meetup-join/[^\s]+',
+        r'https://[a-zA-Z0-9.-]*\.webex\.com/[^\s]+',
+        r'https://[a-zA-Z0-9.-]*\.gotomeeting\.com/[^\s]+'
+    ]
+
+    # Check description
+    description = str(event.get('DESCRIPTION', ''))
+    for pattern in link_patterns:
+        match = re.search(pattern, description)
+        if match:
+            return match.group(0)
+
+    # Check location
+    location = str(event.get('LOCATION', ''))
+    for pattern in link_patterns:
+        match = re.search(pattern, location)
+        if match:
+            return match.group(0)
+
+    # Check URL property
+    url = str(event.get('URL', ''))
+    for pattern in link_patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(0)
+
+    return None
+
+def pick_next_event(events):
+    """Pick the next upcoming event from a list of events."""
+    now = datetime.now(timezone.utc)
+
+    # Check for ongoing meetings first (within 10 minutes of start)
+    ongoing_events = []
+    future_events = []
+
+    for event in events:
+        start = event['dtstart'].dt
+        if hasattr(start, 'tzinfo') and start.tzinfo is None:
+            # Assume naive datetimes are in local timezone
+            start = start.replace(tzinfo=timezone.utc)
+        elif not hasattr(start, 'tzinfo'):
+            # It's a date, convert to datetime at start of day
+            start = datetime.combine(start, datetime.min.time()).replace(tzinfo=timezone.utc)
+
+        # Check if event has an end time
+        end = start + timedelta(hours=1)  # Default 1 hour duration
+        if 'dtend' in event:
+            end = event['dtend'].dt
+            if hasattr(end, 'tzinfo') and end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
+            elif not hasattr(end, 'tzinfo'):
+                end = datetime.combine(end, datetime.max.time()).replace(tzinfo=timezone.utc)
+
+        # If meeting is ongoing and hasn't ended, check if we should show it
+        if start <= now < end:
+            minutes_since_start = (now - start).total_seconds() / 60
+            if minutes_since_start <= 5:
+                # This is our current meeting in the red zone (first 5 minutes)
+                return event
+            ongoing_events.append((start, event))
+        elif start > now:
+            future_events.append((start, event))
+
+    # If no meeting in red zone, return next future event
+    if future_events:
+        future_events.sort(key=lambda x: x[0])
+        return future_events[0][1]
+
+    # If only ongoing meetings past red zone, return the most recent
+    if ongoing_events:
+        ongoing_events.sort(key=lambda x: x[0], reverse=True)
+        return ongoing_events[0][1]
+
+    return None
+
+def format_time(dt):
+    """Format datetime for display."""
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    elif not hasattr(dt, 'tzinfo'):
+        # It's a date
+        return dt.strftime('%b %d')
+
+    # Convert to local time for display
+    local_dt = dt.astimezone()
+    now = datetime.now()
+
+    # If it's today, show time only in 12-hour format
+    if local_dt.date() == now.date():
+        return local_dt.strftime('%-I:%M %p')  # 2:00 PM instead of 14:00
+
+    # If it's this week, show day and time in 12-hour format
+    days_diff = (local_dt.date() - now.date()).days
+    if 0 < days_diff <= 7:
+        return local_dt.strftime('%a %-I:%M %p')  # Mon 2:00 PM
+
+    # Otherwise show date and time in 12-hour format
+    return local_dt.strftime('%b %d %-I:%M %p')  # Sep 20 2:00 PM
+
+def get_time_until(dt):
+    """Get time until the event in a human readable format."""
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    elif not hasattr(dt, 'tzinfo'):
+        dt = datetime.combine(dt, datetime.min.time()).replace(tzinfo=timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    diff = dt - now
+
+    if diff.total_seconds() <= 0:
+        # Meeting has started
+        minutes_since_start = abs(diff.total_seconds() / 60)
+        if minutes_since_start <= 5:
+            return "now!"  # Urgent - just started
+        else:
+            return "ongoing"  # Meeting is in progress
+
+    minutes = int(diff.total_seconds() / 60)
+
+    if minutes < 60:
+        return f"{minutes}m"
+
+    hours = minutes // 60
+    remaining_minutes = minutes % 60
+
+    if hours < 24:
+        if remaining_minutes == 0:
+            return f"{hours}h"
+        return f"{hours}h {remaining_minutes}m"
+
+    days = hours // 24
+    return f"{days}d"
+
+def get_css_class(dt):
+    """Get CSS class based on how soon the event is."""
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    elif not hasattr(dt, 'tzinfo'):
+        dt = datetime.combine(dt, datetime.min.time()).replace(tzinfo=timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    diff = dt - now
+
+    # If meeting has started (negative diff)
+    if diff.total_seconds() <= 0:
+        # Show red for first 5 minutes after start
+        minutes_since_start = abs(diff.total_seconds() / 60)
+        if minutes_since_start <= 5:
+            return "started"  # Red background - just started
+        else:
+            return "ongoing"  # Meeting is ongoing past 5 minutes
+
+    minutes = diff.total_seconds() / 60
+
+    if minutes <= 10:
+        return "soon"  # Green - within 10 minutes
+    elif minutes <= 30:
+        return "warning"  # Yellow - within 30 minutes
+    else:
+        return "later"  # No color - greater than 30 minutes
+
+def get_next_event():
+    """Get the next event without JSON formatting (for --open and --link flags)."""
+    config_dir = Path.home() / '.config' / 'next-event'
+    calendars_file = config_dir / 'calendars.txt'
+    cache_dir = Path.home() / '.cache' / 'next-event'
+
+    if not calendars_file.exists():
+        return None
+
+    all_events = []
+
+    try:
+        with open(calendars_file, 'r') as f:
+            urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+
+        for i, url in enumerate(urls):
+            cache_file = cache_dir / f'calendar_{i}.json'
+            ics_content = fetch_ics(url, cache_file)
+
+            if not ics_content:
+                continue
+
+            try:
+                cal = Calendar.from_ical(ics_content)
+                start_date = datetime.now().date()
+                end_date = start_date + timedelta(days=30)
+                events = recurring_ical_events.of(cal).between(start_date, end_date)
+                all_events.extend(events)
+            except Exception:
+                continue
+    except Exception:
+        return None
+
+    if not all_events:
+        return None
+
+    return pick_next_event(all_events)
+
+def output_json(event_data):
+    """Output the event data as JSON for Waybar."""
+    print(json.dumps(event_data, ensure_ascii=False))
+
+def main():
+    import sys
+
+    # Handle command line arguments
+    if len(sys.argv) > 1:
+        if sys.argv[1] == '--open':
+            # Get the next event and open its link
+            next_event = get_next_event()
+            if next_event:
+                link = extract_link(next_event)
+                if link:
+                    subprocess.run(['xdg-open', link])
+                    return
+                else:
+                    # No meeting link, open Google Calendar
+                    subprocess.run(['xdg-open', 'https://calendar.google.com'])
+                    return
+            else:
+                # No events, open Google Calendar
+                subprocess.run(['xdg-open', 'https://calendar.google.com'])
+                return
+        elif sys.argv[1] == '--link':
+            # Print the meeting link
+            next_event = get_next_event()
+            if next_event:
+                link = extract_link(next_event)
+                if link:
+                    print(link)
+                    return
+            # No link found
+            print("")
+            return
+
+    config_dir = Path.home() / '.config' / 'next-event'
+    calendars_file = config_dir / 'calendars.txt'
+    cache_dir = Path.home() / '.cache' / 'next-event'
+
+    if not calendars_file.exists():
+        output_json({
+            "text": "No calendar configured",
+            "class": "none",
+            "tooltip": "Add calendar URLs to ~/.config/next-event/calendars.txt"
+        })
+        return
+
+    all_events = []
+
+    try:
+        with open(calendars_file, 'r') as f:
+            urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+
+        for i, url in enumerate(urls):
+            cache_file = cache_dir / f'calendar_{i}.json'
+            ics_content = fetch_ics(url, cache_file)
+
+            if not ics_content:
+                continue
+
+            try:
+                cal = Calendar.from_ical(ics_content)
+
+                # Get events for the next 30 days
+                start_date = datetime.now().date()
+                end_date = start_date + timedelta(days=30)
+
+                events = recurring_ical_events.of(cal).between(start_date, end_date)
+                all_events.extend(events)
+
+            except Exception as e:
+                print(f"Error parsing calendar {i}: {e}", file=sys.stderr)
+                continue
+
+    except Exception as e:
+        output_json({
+            "text": "Config error",
+            "class": "none",
+            "tooltip": f"Error reading config: {e}"
+        })
+        return
+
+    if not all_events:
+        output_json({
+            "text": "No upcoming events",
+            "class": "none",
+            "tooltip": "No events found in the next 30 days"
+        })
+        return
+
+    next_event = pick_next_event(all_events)
+
+    if not next_event:
+        output_json({
+            "text": "No upcoming events",
+            "class": "none",
+            "tooltip": "No events found in the next 30 days"
+        })
+        return
+
+    # Extract event details
+    summary = str(next_event.get('SUMMARY', 'Untitled Event'))
+    start_dt = next_event['DTSTART'].dt
+
+    # Check if event is more than 3 hours away
+    if hasattr(start_dt, 'tzinfo') and start_dt.tzinfo is None:
+        start_dt_utc = start_dt.replace(tzinfo=timezone.utc)
+    elif not hasattr(start_dt, 'tzinfo'):
+        start_dt_utc = datetime.combine(start_dt, datetime.min.time()).replace(tzinfo=timezone.utc)
+    else:
+        start_dt_utc = start_dt
+
+    now = datetime.now(timezone.utc)
+    hours_until = (start_dt_utc - now).total_seconds() / 3600
+
+    # Don't show events more than 3 hours away
+    if hours_until > 3:
+        output_json({
+            "text": "",
+            "class": "hidden",
+            "tooltip": ""
+        })
+        return
+
+    # Format display text
+    time_str = format_time(start_dt)
+    time_until = get_time_until(start_dt)
+    css_class = get_css_class(start_dt)
+
+    # Create display text
+    if len(summary) > 30:
+        display_summary = summary[:27] + "..."
+    else:
+        display_summary = summary
+
+    text = f"{display_summary} ({time_until})"
+
+    # Create tooltip
+    tooltip = f"{summary}\n{time_str}"
+
+    link = extract_link(next_event)
+
+    # Prepare output
+    event_output = {
+        "text": text,
+        "class": css_class,
+        "tooltip": tooltip
+    }
+
+    output_json(event_output)
+
+if __name__ == "__main__":
+    main()

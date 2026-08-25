@@ -1,0 +1,5 @@
+# One public or private ICS feed URL per line.
+# Treat private Google Calendar ICS URLs like passwords.
+#
+# https://calendar.example.com/path/calendar.ics
+
