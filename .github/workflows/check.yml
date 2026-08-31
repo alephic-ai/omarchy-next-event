@@ -1,0 +1,39 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: archlinux:base
+    env:
+      OMARCHY_PATH: /tmp/omarchy
+
+    steps:
+      - name: Install system tools
+        shell: bash
+        run: pacman -Syu --noconfirm git jq python quickshell qt6-declarative shellcheck uv
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out Omarchy shell API
+        shell: bash
+        run: |
+          git init --quiet "$OMARCHY_PATH"
+          git -C "$OMARCHY_PATH" fetch --quiet --depth=1 \
+            https://github.com/basecamp/omarchy.git \
+            13f18b2cb7286fb54f87daf571a031aa6af3d8f0
+          git -C "$OMARCHY_PATH" checkout --quiet --detach FETCH_HEAD
+
+      - name: Run checks
+        shell: bash
+        run: ./check.sh

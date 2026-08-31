@@ -12,7 +12,7 @@ BarWidget {
   property string displayTooltip: ""
   property string displayClass: ""
   property string errorText: ""
-  property bool refreshing: false
+  property bool forceRefreshPending: false
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 60, 30, 3600)
   readonly property string runnerPath: localPath("runner.sh")
@@ -38,15 +38,26 @@ BarWidget {
     return decodeURIComponent(value)
   }
 
-  function refresh() {
-    if (statusProcess.running) return
-    if (configuredPythonPath !== "") {
-      statusProcess.command = [configuredPythonPath, root.scriptPath()]
-    } else {
-      statusProcess.command = [root.runnerPath]
+  function refresh(forceRefresh) {
+    if (statusProcess.running) {
+      if (forceRefresh === true && statusProcess.command.indexOf("--force-refresh") === -1) {
+        forceRefreshPending = true
+      }
+      return
     }
-    refreshing = true
+    var command
+    if (configuredPythonPath !== "") {
+      command = [configuredPythonPath, root.scriptPath()]
+    } else {
+      command = [root.runnerPath]
+    }
+    if (forceRefresh === true) command.push("--force-refresh")
+    statusProcess.command = command
     statusProcess.running = true
+  }
+
+  function forceRefresh() {
+    refresh(true)
   }
 
   function applyOutput(raw) {
@@ -101,7 +112,7 @@ BarWidget {
   IpcHandler {
     target: root.moduleName
 
-    function refresh(): void { root.broadcast("refresh") }
+    function refresh(): void { root.broadcast("forceRefresh") }
     function open(): void { root.openMeeting() }
   }
 
@@ -120,11 +131,14 @@ BarWidget {
     }
 
     onExited: function(exitCode) {
-      root.refreshing = false
       var stdout = String(statusStdout.text || "")
       var stderr = String(statusStderr.text || "").trim()
       if (exitCode === 0) root.applyOutput(stdout)
       else root.showError(stderr || stdout || ("Calendar helper exited with code " + exitCode))
+      if (root.forceRefreshPending) {
+        root.forceRefreshPending = false
+        root.refresh(true)
+      }
     }
   }
 
@@ -147,7 +161,7 @@ BarWidget {
     verticalPadding: 8.75
 
     onPressed: function(buttonCode) {
-      if (buttonCode === Qt.MiddleButton) root.refresh()
+      if (buttonCode === Qt.MiddleButton) root.forceRefresh()
       else if (buttonCode === Qt.RightButton) root.openCalendar()
       else root.openMeeting()
     }

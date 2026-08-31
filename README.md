@@ -44,7 +44,14 @@ Run the CLI:
 
 ```bash
 uv run ./next-event
+uv run ./next-event --force-refresh
 uv run ./next-event --open
+```
+
+Run the regression suite with:
+
+```bash
+uv run python -m unittest -v
 ```
 
 Do not commit a private calendar URL. The local `calendars.txt` file is
@@ -83,11 +90,16 @@ To place it in the bar manually:
 omarchy plugin enable io.github.noahbrier.next-event --section center
 ```
 
-To validate the plugin during development:
+Install the development lint tools:
 
 ```bash
-omarchy plugin validate .
-qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml
+omarchy pkg add shellcheck qt6-declarative
+```
+
+Run the complete test and lint suite:
+
+```bash
+./check.sh
 ```
 
 ## License
