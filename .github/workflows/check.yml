@@ -36,4 +36,8 @@ jobs:
 
       - name: Run checks
         shell: bash
-        run: ./check.sh
+        run: |
+          # The archlinux container runs as a different user than the checkout owner,
+          # so git refuses the workspace as "dubious ownership" without this.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ./check.sh
